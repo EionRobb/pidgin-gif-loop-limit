@@ -294,21 +294,14 @@ gif_loop_limit_advance(GdkPixbufAnimationIter *iter, const GTimeVal *current_tim
 
 	GdkPixbufGifAnimIter *gif_iter = (GdkPixbufGifAnimIter *)iter;
 	if (gif_iter->gif_anim && gif_iter->gif_anim->total_time > 0) {
-		if (data->last_frame != NULL &&
-		    gif_iter->current_frame == gif_iter->gif_anim->frames &&
-		    data->last_frame != gif_iter->current_frame) {
+		if (data->last_position >= 0 &&
+		    gif_iter->position < data->last_position &&
+		    (data->last_position - gif_iter->position > gif_iter->gif_anim->total_time / 3)) {
 			data->current_loop++;
 			purple_debug_info("gif_loop_limit", "Loop completed: %d/%d on iter %p\n",
 				data->current_loop, data->loop_limit, iter);
-		} else if (data->last_position > 0 &&
-		           gif_iter->position < data->last_position &&
-		           (data->last_position - gif_iter->position > gif_iter->gif_anim->total_time / 2)) {
-			data->current_loop++;
-			purple_debug_info("gif_loop_limit", "Loop completed (by position): %d/%d on iter %p\n",
-				data->current_loop, data->loop_limit, iter);
 		}
 
-		data->last_frame = gif_iter->current_frame;
 		data->last_position = gif_iter->position;
 
 		if (data->current_loop >= data->loop_limit) {
@@ -557,13 +550,6 @@ gif_resume_playback(GifLoopData *data)
 	data->last_frame = NULL;
 	data->last_position = -1;
 
-	GdkPixbufGifAnimIter *gif_iter = (GdkPixbufGifAnimIter *)data->anim->iter;
-	if (gif_iter && gif_iter->gif_anim) {
-		g_get_current_time(&gif_iter->start_time);
-		gif_iter->first_loop_slowness = 0;
-		gif_iter->position = 0;
-		gif_iter->current_frame = gif_iter->gif_anim->frames;
-	}
 
 	int delay = gdk_pixbuf_animation_iter_get_delay_time(data->anim->iter);
 	if (delay <= 0) delay = 100;
@@ -826,8 +812,8 @@ static PidginPluginUiInfo ui_info =
 static PurplePluginInfo info =
 {
 	PURPLE_PLUGIN_MAGIC,
-	PURPLE_MAJOR_VERSION,
-	PURPLE_MINOR_VERSION,
+	2,
+	10,
 	PURPLE_PLUGIN_STANDARD,
 	PIDGIN_PLUGIN_TYPE,
 	0,
@@ -840,7 +826,7 @@ static PurplePluginInfo info =
 	PLUGIN_SUMMARY,
 	PLUGIN_DESCRIPTION,
 	PLUGIN_AUTHOR,
-	"https://pidgin.im",
+	"https://github.com/EionRobb/pidgin-gif-loop-limit",
 
 	plugin_load,
 	plugin_unload,
