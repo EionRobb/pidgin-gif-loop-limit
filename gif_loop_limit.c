@@ -106,6 +106,7 @@ typedef struct _GifLoopData {
 
 	GdkPixbuf          *saved_clean_pixbuf;
 	gulong              event_handler_id;
+	gulong              destroy_handler_id;
 } GifLoopData;
 
 static gboolean (*orig_advance)(GdkPixbufAnimationIter *iter, const GTimeVal *current_time) = NULL;
@@ -122,6 +123,10 @@ static void gif_remove_play_overlay(GifLoopData *data);
 static void gif_resume_playback(GifLoopData *data);
 static gboolean pause_animation_idle_cb(gpointer user_data);
 static gboolean event_box_event_cb(GtkWidget *widget, GdkEvent *event, gpointer user_data);
+static void event_box_destroy_cb(GtkWidget *widget, gpointer user_data);
+static void event_box_weak_notify(gpointer user_data, GObject *where_the_object_was);
+static void gif_loop_data_detach_event_box(GifLoopData *data);
+static void gif_loop_data_attach_event_box(GifLoopData *data, GtkWidget *image_widget);
 static void gif_hook_imhtml(GtkIMHtml *imhtml);
 
 static gboolean
@@ -138,11 +143,101 @@ is_imhtml_animation(GtkIMHtmlScalable *scale)
 	return FALSE;
 }
 
+static void
+event_box_destroy_cb(GtkWidget *widget, gpointer user_data)
+{
+	GifLoopData *data = user_data;
+	if (!data || data->event_box != widget)
+		return;
+
+	g_object_weak_unref(G_OBJECT(widget), event_box_weak_notify, data);
+	data->event_box = NULL;
+	data->image_widget = NULL;
+	data->event_handler_id = 0;
+	data->destroy_handler_id = 0;
+}
+
+static void
+event_box_weak_notify(gpointer user_data, GObject *where_the_object_was)
+{
+	GifLoopData *data = user_data;
+	if (!data)
+		return;
+
+	if ((gpointer)data->event_box == (gpointer)where_the_object_was) {
+		data->event_box = NULL;
+		data->image_widget = NULL;
+		data->event_handler_id = 0;
+		data->destroy_handler_id = 0;
+	}
+}
+
+static void
+gif_loop_data_detach_event_box(GifLoopData *data)
+{
+	if (!data || !data->event_box)
+		return;
+
+	if (data->destroy_handler_id > 0) {
+		g_signal_handler_disconnect(data->event_box, data->destroy_handler_id);
+		data->destroy_handler_id = 0;
+	}
+	if (data->event_handler_id > 0) {
+		g_signal_handler_disconnect(data->event_box, data->event_handler_id);
+		data->event_handler_id = 0;
+	}
+	g_object_weak_unref(G_OBJECT(data->event_box), event_box_weak_notify, data);
+
+	if (GTK_WIDGET_REALIZED(data->event_box) && data->event_box->window) {
+		gdk_window_set_cursor(data->event_box->window, NULL);
+	}
+
+	data->event_box = NULL;
+	data->image_widget = NULL;
+}
+
+static void
+gif_loop_data_attach_event_box(GifLoopData *data, GtkWidget *image_widget)
+{
+	if (!data || !image_widget)
+		return;
+
+	GtkWidget *box = gtk_widget_get_parent(image_widget);
+	if (!box || !GTK_IS_EVENT_BOX(box))
+		return;
+
+	if (data->event_box == box)
+		return;
+
+	gif_loop_data_detach_event_box(data);
+
+	data->image_widget = image_widget;
+	data->event_box = box;
+	data->destroy_handler_id = g_signal_connect(G_OBJECT(box),
+		"destroy", G_CALLBACK(event_box_destroy_cb), data);
+	data->event_handler_id = g_signal_connect(G_OBJECT(box),
+		"event", G_CALLBACK(event_box_event_cb), data);
+	g_object_weak_ref(G_OBJECT(box), event_box_weak_notify, data);
+}
+
+static void
+gif_loop_data_attach_anim(GifLoopData *data, GtkIMHtmlAnimation *anim)
+{
+	if (!data || !anim)
+		return;
+
+	data->anim = anim;
+	data->iter = anim->iter;
+
+	if (anim->imhtmlimage.image) {
+		gif_loop_data_attach_event_box(data, GTK_WIDGET(anim->imhtmlimage.image));
+	}
+}
+
 static GifLoopData *
 gif_loop_data_new(GtkIMHtmlAnimation *anim)
 {
 	GifLoopData *data = g_new0(GifLoopData, 1);
-	data->anim = anim;
 	data->loop_limit = purple_prefs_get_int(PREF_INITIAL_LOOPS);
 	if (data->loop_limit <= 0)
 		data->loop_limit = 3;
@@ -151,16 +246,7 @@ gif_loop_data_new(GtkIMHtmlAnimation *anim)
 	data->last_position = -1;
 
 	if (anim) {
-		data->iter = anim->iter;
-		if (anim->imhtmlimage.image) {
-			data->image_widget = GTK_WIDGET(anim->imhtmlimage.image);
-			data->event_box = gtk_widget_get_parent(data->image_widget);
-
-			if (data->event_box && GTK_IS_EVENT_BOX(data->event_box)) {
-				data->event_handler_id = g_signal_connect(G_OBJECT(data->event_box),
-					"event", G_CALLBACK(event_box_event_cb), data);
-			}
-		}
+		gif_loop_data_attach_anim(data, anim);
 	}
 
 	active_loop_data_list = g_list_prepend(active_loop_data_list, data);
@@ -184,44 +270,17 @@ gif_loop_data_free(GifLoopData *data)
 		data->custom_timer_id = 0;
 	}
 
-	if (data->event_box && data->event_handler_id > 0) {
-		if (g_signal_handler_is_connected(G_OBJECT(data->event_box), data->event_handler_id)) {
-			g_signal_handler_disconnect(G_OBJECT(data->event_box), data->event_handler_id);
-		}
-		data->event_handler_id = 0;
+	gif_loop_data_detach_event_box(data);
+
+	if (data->saved_clean_pixbuf) {
+		g_object_unref(data->saved_clean_pixbuf);
+		data->saved_clean_pixbuf = NULL;
 	}
 
-	if (data->event_box && GTK_WIDGET_REALIZED(data->event_box) && data->event_box->window) {
-		gdk_window_set_cursor(data->event_box->window, NULL);
-	}
-
-	gif_remove_play_overlay(data);
-
-	if (data->iter) {
-		g_object_set_data(G_OBJECT(data->iter), "gif_loop_data", NULL);
-	}
+	data->anim = NULL;
+	data->iter = NULL;
 
 	g_free(data);
-}
-
-static void
-gif_loop_data_attach_anim(GifLoopData *data, GtkIMHtmlAnimation *anim)
-{
-	if (!data || !anim)
-		return;
-
-	data->anim = anim;
-	data->iter = anim->iter;
-
-	if (anim->imhtmlimage.image) {
-		data->image_widget = GTK_WIDGET(anim->imhtmlimage.image);
-		data->event_box = gtk_widget_get_parent(data->image_widget);
-
-		if (data->event_box && GTK_IS_EVENT_BOX(data->event_box) && data->event_handler_id == 0) {
-			data->event_handler_id = g_signal_connect(G_OBJECT(data->event_box),
-				"event", G_CALLBACK(event_box_event_cb), data);
-		}
-	}
 }
 
 static void
@@ -241,7 +300,7 @@ gif_find_and_attach_anim(GifLoopData *data, GdkPixbufAnimationIter *iter)
 			GList *sl;
 			for (sl = imhtml->scalables; sl != NULL; sl = sl->next) {
 				struct scalable_data *sd = sl->data;
-				if (sd && sd->scalable && (is_imhtml_animation(sd->scalable) || ((GtkIMHtmlAnimation *)sd->scalable)->iter == iter)) {
+				if (sd && sd->scalable && is_imhtml_animation(sd->scalable)) {
 					GtkIMHtmlAnimation *anim = (GtkIMHtmlAnimation *)sd->scalable;
 					if (anim->iter == iter) {
 						gif_loop_data_attach_anim(data, anim);
@@ -256,7 +315,7 @@ gif_find_and_attach_anim(GifLoopData *data, GdkPixbufAnimationIter *iter)
 			GList *sl;
 			for (sl = imhtml->scalables; sl != NULL; sl = sl->next) {
 				struct scalable_data *sd = sl->data;
-				if (sd && sd->scalable && (is_imhtml_animation(sd->scalable) || ((GtkIMHtmlAnimation *)sd->scalable)->iter == iter)) {
+				if (sd && sd->scalable && is_imhtml_animation(sd->scalable)) {
 					GtkIMHtmlAnimation *anim = (GtkIMHtmlAnimation *)sd->scalable;
 					if (anim->iter == iter) {
 						gif_loop_data_attach_anim(data, anim);
@@ -284,7 +343,7 @@ gif_loop_limit_advance(GdkPixbufAnimationIter *iter, const GTimeVal *current_tim
 		data->iter = iter;
 		g_object_set_data_full(G_OBJECT(iter), "gif_loop_data", data, (GDestroyNotify)gif_loop_data_free);
 		gif_find_and_attach_anim(data, iter);
-	} else if (!data->anim) {
+	} else if (!data->anim || !data->event_box) {
 		gif_find_and_attach_anim(data, iter);
 	}
 
@@ -340,12 +399,7 @@ pause_animation_idle_cb(gpointer user_data)
 	data->is_paused = TRUE;
 
 	if (data->anim && !data->event_box && data->anim->imhtmlimage.image) {
-		data->image_widget = GTK_WIDGET(data->anim->imhtmlimage.image);
-		data->event_box = gtk_widget_get_parent(data->image_widget);
-		if (data->event_box && GTK_IS_EVENT_BOX(data->event_box) && data->event_handler_id == 0) {
-			data->event_handler_id = g_signal_connect(G_OBJECT(data->event_box),
-				"event", G_CALLBACK(event_box_event_cb), data);
-		}
+		gif_loop_data_attach_event_box(data, GTK_WIDGET(data->anim->imhtmlimage.image));
 	}
 
 	gif_overlay_play_icon(data);
@@ -368,10 +422,10 @@ gif_overlay_play_icon(GifLoopData *data)
 	if (!purple_prefs_get_bool(PREF_SHOW_PLAY_ICON))
 		return;
 
-	if (!data->anim || !data->anim->imhtmlimage.image)
+	if (!data->event_box || !data->image_widget || !GTK_IS_IMAGE(data->image_widget))
 		return;
 
-	GtkImage *gtk_img = data->anim->imhtmlimage.image;
+	GtkImage *gtk_img = GTK_IMAGE(data->image_widget);
 	GdkPixbuf *current_pixbuf = gtk_image_get_pixbuf(gtk_img);
 	if (!current_pixbuf)
 		return;
@@ -461,8 +515,10 @@ gif_overlay_play_icon(GifLoopData *data)
 static void
 gif_remove_play_overlay(GifLoopData *data)
 {
-	if (data->saved_clean_pixbuf && data->anim && data->anim->imhtmlimage.image) {
-		gtk_image_set_from_pixbuf(data->anim->imhtmlimage.image, data->saved_clean_pixbuf);
+	if (data->saved_clean_pixbuf) {
+		if (data->event_box && data->image_widget && GTK_IS_IMAGE(data->image_widget)) {
+			gtk_image_set_from_pixbuf(GTK_IMAGE(data->image_widget), data->saved_clean_pixbuf);
+		}
 		g_object_unref(data->saved_clean_pixbuf);
 		data->saved_clean_pixbuf = NULL;
 	}
@@ -474,6 +530,11 @@ gif_playback_timer_cb(gpointer user_data)
 	GifLoopData *data = user_data;
 	if (!data || !data->anim)
 		return FALSE;
+
+	if (!data->event_box || !data->image_widget || !GTK_IS_IMAGE(data->image_widget)) {
+		data->custom_timer_id = 0;
+		return FALSE;
+	}
 
 	GtkIMHtmlAnimation *anim = data->anim;
 
@@ -628,7 +689,7 @@ gif_hook_imhtml(GtkIMHtml *imhtml)
 				if (!data) {
 					data = gif_loop_data_new(anim);
 					g_object_set_data_full(G_OBJECT(anim->iter), "gif_loop_data", data, (GDestroyNotify)gif_loop_data_free);
-				} else if (!data->anim) {
+				} else if (!data->anim || !data->event_box) {
 					gif_loop_data_attach_anim(data, anim);
 				}
 			}
@@ -766,6 +827,15 @@ plugin_unload(PurplePlugin *plugin)
 
 	while (active_loop_data_list != NULL) {
 		GifLoopData *data = active_loop_data_list->data;
+		if (data->iter) {
+			GdkPixbufAnimationIter *iter = data->iter;
+			data->iter = NULL;
+			if (data->saved_clean_pixbuf && data->event_box && data->image_widget &&
+			    GTK_IS_IMAGE(data->image_widget)) {
+				gtk_image_set_from_pixbuf(GTK_IMAGE(data->image_widget), data->saved_clean_pixbuf);
+			}
+			g_object_steal_data(G_OBJECT(iter), "gif_loop_data");
+		}
 		gif_loop_data_free(data);
 	}
 
